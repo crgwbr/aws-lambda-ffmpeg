@@ -11,8 +11,6 @@ var zip = require('gulp-zip');
 var AWS = require('aws-sdk');
 var runSequence = require('run-sequence');
 var async = require('async');
-var s3 = new AWS.S3();
-var lambda = new AWS.Lambda();
 
 var config;
 try {
@@ -20,6 +18,11 @@ try {
 } catch (ex) {
 	config = {};
 }
+
+AWS.config.update(config.aws);
+
+var s3 = new AWS.S3();
+var lambda = new AWS.Lambda();
 
 var filename = './build/ffmpeg-git-64bit-static.tar.xz';
 var fileURL = 'http://johnvansickle.com/ffmpeg/builds/ffmpeg-git-64bit-static.tar.xz';

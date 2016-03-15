@@ -3,20 +3,18 @@ process.env['PATH'] += ':' + process.env['LAMBDA_TASK_ROOT'];
 
 var child_process = require('child_process');
 var fs = require('fs');
-var util = require('util');
-var zlib = require('zlib');
 var crypto = require('crypto');
 var stream = require('stream');
 var path = require('path');
 var AWS = require('aws-sdk');
 var async = require('async');
 var config = require('./config');
-var scaleFilter = "scale='min(" + config.videoMaxWidth.toString() + "\\,iw):-2'";
 var s3 = new AWS.S3();
 var tempDir = process.env['TEMP'] || '/tmp';
 
+
 function downloadStream(bucket, file, cb) {
-	console.log('Starting download');
+	console.log('Starting download of ' + file);
 
 	return s3.getObject({
 		Bucket: bucket,
@@ -26,185 +24,210 @@ function downloadStream(bucket, file, cb) {
 	}).createReadStream();
 }
 
-function s3upload(params, filename, cb) {
+
+function s3upload(params, filepath, cb) {
 	s3.upload(params)
 		.on('httpUploadProgress', function(evt) {
-			console.log(filename, 'Progress:', evt.loaded, '/', evt.total);
+			console.log(filepath, 'Progress:', evt.loaded, '/', evt.total);
 		})
 		.send(cb);
 }
 
-function uploadFile(fileExt, bucket, keyPrefix, contentType, cb) {
-	console.log('Uploading', contentType);
 
-	var filename = path.join(tempDir, 'out.' + fileExt);
-	var rmFiles = [filename];
-	var readStream = fs.createReadStream(filename);
+function uploadFile(filepath, bucket, contentType, cb) {
+	console.log('Uploading ' + filename);
+
+	var filename = filepath.split('/').pop();
+	var readStream = fs.createReadStream(filepath);
 
 	var params = {
 		Bucket: bucket,
-		Key: keyPrefix + '.' + fileExt,
+		Key: filename,
 		ContentType: contentType,
 		CacheControl: 'max-age=31536000' // 1 year (60 * 60 * 24 * 365)
 	};
 
 	async.waterfall([
 		function(cb) {
-			if (!config.gzip)
-				return cb(null, readStream, filename);
-
-			var gzipFilename = filename + '.gzip';
-
-			rmFiles.push(gzipFilename);
-			params.ContentEncoding = 'gzip';
-
-			var gzipWriteStream = fs.createWriteStream(gzipFilename);
-
-			gzipWriteStream.on('finish', function() {
-				cb(null, fs.createReadStream(filename), gzipFilename);
-			});
-
-			readStream
-				.pipe(zlib.createGzip({level: zlib.Z_BEST_COMPRESSION}))
-				.pipe(gzipWriteStream);
-		},
-		function(fstream, uploadFilename, cb) {
-			console.log('Begin hashing', uploadFilename);
+			console.log('Begin hashing ' + filepath);
 
 			var hash = crypto.createHash('sha256');
 
-			fstream.on('data', function(d) {
+			readStream.on('data', function(d) {
 				hash.update(d);
 			});
 
-			fstream.on('end', function() {
-				cb(null, fs.createReadStream(uploadFilename), hash.digest('hex'));
+			readStream.on('end', function() {
+				cb(null, fs.createReadStream(filepath), hash.digest('hex'));
 			});
 		},
 		function(fstream, hashdigest, cb) {
-			console.log(filename, 'hashDigest:', hashdigest);
+			console.log(filename + ' hashDigest:' + hashdigest);
 			params.Body = fstream;
 
-			if (hashdigest)
+			if (hashdigest) {
 				params.Metadata = {'sha256': hashdigest};
+			}
 
-			s3upload(params, filename, cb);
+			s3upload(params, filepath, cb);
 		},
 		function(data, cb) {
-			console.log(filename, 'complete. Deleting now.');
-			async.each(rmFiles, fs.unlink, cb);
+			console.log('Uploading ' + filename + ' complete.');
 		}
 	], cb);
 }
 
-function ffprobeVerify(cb) {
-	console.log('Starting FFprobe');
 
-	child_process.execFile(
-		'ffprobe',
-		[
-			'-v', 'quiet',
-			'-print_format', 'json',
-			'-show_format',
-			'-show_streams',
-			'-i', 'download'
-		],
-		{
-			cwd: tempDir
-		},
-		function(err, stdout, stderr) {
-			if (err) return cb(err, 'FFprobe failed' + JSON.stringify({ stdout: stdout, stderr: stderr}));
+function ffmpegProcess(inputFile, outputName, cb) {
+	console.log('Starting FFmpeg. Saving to ' + outputName);
 
-			var outputObj = JSON.parse(stdout);
-			var maxDuration = config.videoMaxDuration;
+	var opt = ['-framerate', '30', '-y', '-i', inputFile, '-c:v', 'libx264', '-vf', 'fps=30', outputName];
+	child_process.execFile('ffmpeg', opt, { cwd: tempDir }, function(err, stdout, stderr) {
+		console.log('FFmpeg done.');
+		return cb(err, 'FFmpeg finished:' + JSON.stringify({ stdout: stdout, stderr: stderr}));
+	});
+}
 
-			var hasVideoStream = outputObj.streams.some(function(stream) {
-				return stream.codec_type === 'video' &&
-						(stream.duration || outputObj.format.duration) <= maxDuration;
-			});
 
-			if (!hasVideoStream)
-				return cb('FFprobe: no valid video stream found');
-			else {
-				console.log('valid video stream found', stdout);
-				return cb(err, 'FFprobe finished');
+function listObjectsInFolder(bucket, prefix, cb) {
+	console.log('Listing objects in folder ' + prefix);
+	var options, data = [];
+
+	options = {
+		Bucket: bucket,
+		Prefix: prefix
+	};
+
+	(function doList() {
+		s3.listObjects(options, function(err, partData) {
+			var key;
+			if (err) {
+				return cb(err, data);
 			}
-		}
-	);
+
+			for (var i=0; i < partData.Contents.length; i++) {
+				key = partData.Contents[i].Key;
+				if (key[key.length-1] !== '/') {
+					data.push(key);
+				}
+			}
+
+			if (data.IsTruncated) {
+				options.KeyMarker = partData.NextKeyMarker;
+				options.VersionIdMarker = partData.NextVersionIdMarker;
+				doList();
+			} else {
+				cb(null, data);
+			}
+		});
+	}());
 }
 
-function ffmpegProcess(description, cb) {
-	console.log('Starting FFmpeg');
 
-	child_process.execFile(
-		'ffmpeg',
-		[
-			'-y',
-			'-loglevel', 'warning',
-			'-i', 'download',
-			'-c:a', 'copy',
-			'-vf', scaleFilter,
-			'-movflags', '+faststart',
-			'-metadata', 'description=' + description,
-			'out.' + config.format.video.extension,
-			'-vf', 'thumbnail',
-			'-vf', scaleFilter,
-			'-vframes', '1',
-			'out.' + config.format.image.extension
-		],
-		{
-			cwd: tempDir
-		},
-		function(err, stdout, stderr) {
-			console.log('FFmpeg done.');
-			return cb(err, 'FFmpeg finished:' + JSON.stringify({ stdout: stdout, stderr: stderr}));
+function listFoldersInBucket(bucket, prefix, cb) {
+	console.log('Listing folders in bucket ' + bucket);
+	var options = {
+		Bucket: bucket,
+		Prefix: prefix,
+		Delimiter: '/',
+	};
+
+	s3.listObjects(options, function(err, data) {
+		if (err) {
+			return cb(err);
 		}
-	);
+
+		var folders = [];
+		for (i = 0; i < data.CommonPrefixes.length; i++) {
+			folders.push( data.CommonPrefixes[i].Prefix );
+		}
+		folders.sort();
+		cb(null, folders);
+	});
 }
 
-function processVideo(s3Event, srcKey, cb) {
-	var dlFile = path.join(tempDir, 'download');
-
-	async.series([
+function createVideo(cb) {
+	async.waterfall([
 		function(cb) {
-			var dlStream = downloadStream(s3Event.bucket.name, srcKey, cb);
-			dlStream.on('end', function() {
-				cb(null, 'download finished');
+			var prefix = (new Date()).getFullYear() + '-';
+			listFoldersInBucket(config.sourceBucket, prefix, function(err, data) {
+				data = data || [];
+				cb(err, data.pop());
 			});
-			dlStream.pipe(fs.createWriteStream(dlFile));
 		},
-		function(cb) {
-			ffprobeVerify(cb);
+		function(folderName, cb) {
+			listObjectsInFolder(config.sourceBucket, folderName, cb);
 		},
-		function(cb) {
-			ffmpegProcess(config.linkPrefix + '/' + srcKey + '.' + config.format.video.extension, cb);
+		function(files, cb) {
+			var queue = files.slice(),
+				saved = [];
+
+			if (queue.length === 0) {
+				return cb('No files found');
+			}
+
+			queue.sort();
+			(function dlNextFile() {
+				var key = queue.shift(),
+					dlStream = downloadStream(config.sourceBucket, key, cb),
+					ext = key.split('.').pop().toLowerCase(),
+					dlFile = path.join(tempDir, 'img-' + saved.length + '.' + ext);
+				saved.push(dlFile);
+
+				dlStream.on('end', function() {
+					if (queue.length > 0) {
+						dlNextFile();
+					} else {
+						cb(null, saved);
+					}
+				});
+
+				console.log('Saving download as ' + dlFile);
+				dlStream.pipe(fs.createWriteStream(dlFile));
+			}());
 		},
-		function(cb) {
-			console.log('Deleting download file');
-			fs.unlink(dlFile, cb);
+		function(saved, cb) {
+			var now = new Date(),
+				d = [now.getFullYear(), now.getMonth()+1, now.getDate()].join('-'),
+				outputName;
+
+			outputName = path.join(tempDir, d + '_combined.' + config.format.video.extension);
+			ffmpegProcess(path.join(tempDir, '%*.jpg'), outputName, function(err, data) {
+				cb(err, saved, outputName);
+			});
+		},
+		function(saved, output, cb) {
+			uploadFile(output, config.destinationBucket, config.format.video.mimeType, function(err, data) {
+				cb(err, saved.concat([output]));
+			});
+		},
+		function(saved, cb) {
+			(function unlinkNextFile() {
+				var f = saved.shift();
+				console.log('Removing ' + f);
+				fs.unlink(f, function(err, data) {
+					if (err) {
+						return cb(err);
+					}
+
+					if (saved.length > 0) {
+						return unlinkNextFile();
+					}
+
+					cb(null, 'Done!');
+				});
+			}());
 		}
 	], cb);
 }
+
 
 exports.handler = function(event, context) {
-	console.log("Reading options from event:\n", util.inspect(event, {depth: 5}));
-
-	var s3Event = event.Records[0].s3;
-	var srcKey = decodeURIComponent(s3Event.object.key);
-	var keyPrefix = srcKey.replace(/\.[^/.]+$/, '');
-	var format = config.format;
-
-	async.series([
-		function (cb) { processVideo(s3Event, srcKey, cb); },
-		function (cb) {
-			var dstBucket = config.destinationBucket;
-			async.parallel([
-				function (cb) { uploadFile(format.video.extension, dstBucket, keyPrefix, format.video.mimeType, cb); },
-				function (cb) { uploadFile(format.image.extension, dstBucket, keyPrefix, format.image.mimeType, cb); }
-			], cb);
+	createVideo(function(err, results) {
+		if (err) {
+			context.fail(err);
+		} else {
+			context.succeed(results);
 		}
-	], function(err, results) {
-		if (err) context.fail(err);
-		else context.succeed(results);
 	});
 };

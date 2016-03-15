@@ -1,6 +1,6 @@
 {
 	"AWSTemplateFormatVersion": "2010-09-09",
-	"Description": "Resizes a video and produces a thumbnail image",
+	"Description": "Create a video from an S3 folder full of images",
 	"Parameters": {
 		"SourceBucketName": {
 			"Type": "String",
@@ -65,19 +65,10 @@
 								},
 								{
 									"Effect": "Allow",
-									"Action": "s3:GetObject",
-									"Resource": {
-										"Fn::Join": [
-											"",
-											[
-												"arn:aws:s3:::",
-												{
-													"Ref": "SourceBucketName"
-												},
-												"/*"
-											]
-										]
-									}
+									"Action": ["s3:Get*", "s3:List*"],
+									"Resource": [
+										"arn:aws:s3:::*"
+									]
 								},
 								{
 									"Effect": "Allow",
@@ -121,40 +112,10 @@
 						"Arn"
 					]
 				},
-				"Timeout": 30,
+				"Timeout": 300,
 				"Handler": "index.handler",
 				"Runtime": "nodejs",
 				"MemorySize": 1536
-			}
-		},
-		"LambdaPermission": {
-			"Type": "AWS::Lambda::Permission",
-			"DependsOn": [
-				"Lambda"
-			],
-			"Properties": {
-				"Action": "lambda:invokeFunction",
-				"FunctionName": {
-					"Fn::GetAtt": [
-						"Lambda",
-						"Arn"
-					]
-				},
-				"Principal": "s3.amazonaws.com",
-				"SourceAccount": {
-					"Ref": "AWS::AccountId"
-				},
-				"SourceArn": {
-					"Fn::Join": [
-						"",
-						[
-							"arn:aws:s3:::",
-							{
-								"Ref": "SourceBucketName"
-							}
-						]
-					]
-				}
 			}
 		},
 		"SourceBucket": {
@@ -165,19 +126,6 @@
 			"Properties": {
 				"BucketName": {
 					"Ref": "SourceBucketName"
-				},
-				"NotificationConfiguration": {
-					"LambdaConfigurations": [
-						{
-							"Event": "s3:ObjectCreated:*",
-							"Function": {
-								"Fn::GetAtt": [
-									"Lambda",
-									"Arn"
-								]
-							}
-						}
-					]
 				}
 			}
 		},
